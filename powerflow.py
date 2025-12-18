@@ -1,24 +1,20 @@
 """
-Power Flow (PF) module that consumes the *outputs* of your geometric/routing Streamlit app:
+Power Flow (PF) module that consumes the *outputs* of the distribution part:
 
-Inputs (from your first app):
+Inputs:
 - mst_nodes.geojson  (points)  -> poles/nodes
     * expected columns: "id" (node id) OR "pole_id"
 - mst_edges.geojson  (lines)   -> LV network segments
     * expected columns: "source" and "target" (node ids) OR other endpoint pairs
 - associations.csv   (table)   -> building-to-pole mapping
     * expected columns: "pole_id" and "building_id"
-      (also accepts legacy names: pole / building)
 
-This version is specifically adapted to your geometry export schema:
-- Nodes export "id" (0..N-1). We map that to pole_id if pole_id is missing.
-- Edges export "source"/"target". We auto-detect those columns.
-"""
+This version is specifically adapted for Lusanga (DRC) load, the next version taking a load profile and sun availability profiles will come soon
+Morover with big grids, length > 20km infeasibility of the PF may occur, the next version will integrate a stand alone choice part and/or MV net 
 
 import math
 import os
 import io
-
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -34,7 +30,7 @@ st.caption("Uploads: mst_nodes.geojson, mst_edges.geojson, associations.csv")
 
 
 # ======================================================================================
-# DEFAULT 24h PROFILES (keep for standalone run)
+# DEFAULT 24h PROFILES (Lusanga)
 # ======================================================================================
 DEFAULT_HOURLY_TOTAL_KW = {
     1:  14.5,  2:  12.1,  3:  11.4,  4:  7.7,  5:  7.9,  6:  13.0,
