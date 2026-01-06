@@ -7,6 +7,9 @@ import math
 import streamlit as st
 import io
 
+# This is the Version 6 of Distribution, with respect to the original Edo's Distribution the poles in the chart are spaciated maximum of sample_distance.
+# This change gives more realism to the gride and avoid huge voltage drops in the Power Flow analyisis 
+
 # Streamlit app title
 st.title("Grid Routing")
 
@@ -15,6 +18,12 @@ project_name =      st.text_input("Project Name"," ")
 sampling_distance = st.slider("Inter-pole distance (meters)", min_value=10, max_value=100, value=40)
 user_distance =     st.slider("Maximum user-pole distance (meters)", min_value=10, max_value=100, value=35)
 max_associations =  st.slider("Maximum number of users per pole", min_value=10, max_value=50, value=16)
+
+# Post-processing option
+densify_long_edges = st.checkbox(
+    "After pruning, add intermediate poles so no branch exceeds the inter-pole distance",
+    value=True,
+)
 
 # File uploader for roads and users data
 roads_file = st.file_uploader("Upload Roads File (GeoPackage format)", type=['gpkg'])
@@ -151,6 +160,76 @@ def create_graph_and_mst(gdf_associated_poles):
                 G.add_edge(i, j, weight=distance)
     return nx.minimum_spanning_tree(G)
 
+
+def densify_mst_edges(gdf_poles: gpd.GeoDataFrame, mst: nx.Graph, sampling_distance: float) -> tuple[gpd.GeoDataFrame, nx.Graph]:
+    """
+    Post-process the MST by inserting intermediate poles on any edge longer than sampling_distance.
+
+    - Works in *planar metric* CRS (meters).
+    - Does NOT follow roads: it splits the straight segment between MST endpoints.
+    - Guarantees all resulting edges have length <= sampling_distance (up to floating eps).
+
+    Node convention in this app:
+    - MST nodes are 0..N-1 and refer to row positions (iloc) in gdf_poles.
+    """
+
+    if sampling_distance <= 0:
+        return gdf_poles, mst
+
+    poles = gdf_poles.copy().reset_index(drop=True)
+    n0 = len(poles)
+
+    # Build a new graph from scratch to avoid in-place mutation issues
+    G2 = nx.Graph()
+    G2.add_nodes_from(range(n0))
+
+    new_geoms = []  # geometries of inserted poles, appended at the end
+
+    def geom_at(node_id: int):
+        if node_id < n0:
+            return poles.geometry.iloc[node_id]
+        else:
+            return new_geoms[node_id - n0]
+
+    next_id = n0
+
+    for u, v in list(mst.edges()):
+        pu = geom_at(u)
+        pv = geom_at(v)
+        L = pu.distance(pv)
+
+        if L <= sampling_distance + 1e-9:
+            G2.add_edge(u, v, weight=float(L))
+            continue
+
+        # Split into n_segments so each segment <= sampling_distance
+        n_segments = int(math.ceil(L / sampling_distance))
+        chain = [u]
+
+        for k in range(1, n_segments):
+            frac = k / n_segments
+            x = pu.x + frac * (pv.x - pu.x)
+            y = pu.y + frac * (pv.y - pu.y)
+            new_geoms.append(Point(float(x), float(y)))
+            chain.append(next_id)
+            next_id += 1
+
+        chain.append(v)
+
+        for a, b in zip(chain[:-1], chain[1:]):
+            pa = geom_at(a)
+            pb = geom_at(b)
+            d = pa.distance(pb)
+            G2.add_edge(a, b, weight=float(d))
+
+    # Append new poles (no buildings associated to these)
+    if new_geoms:
+        gdf_new = gpd.GeoDataFrame({'geometry': new_geoms}, crs=poles.crs)
+        poles = pd.concat([poles, gdf_new], ignore_index=True)
+        poles = gpd.GeoDataFrame(poles, geometry='geometry', crs=gdf_poles.crs)
+
+    return poles, G2
+
 def plot_map_with_mst_and_connections(gdf_roads, gdf_final_poles, gdf_buildings, mst):
     minx, miny, maxx, maxy = gdf_final_poles.total_bounds
     distance_x = maxx - minx
@@ -165,7 +244,7 @@ def plot_map_with_mst_and_connections(gdf_roads, gdf_final_poles, gdf_buildings,
     fig, ax = plt.subplots(figsize=(12, 6))
 
     gdf_roads.plot(color='gray', linewidth=0.5, ax=ax, label='Roads')
-    gdf_buildings.plot(color='lightblue', alpha=0.5, ax=ax, label='Users')
+    gdf_buildings.plot(color='red', markersize=15, ax=ax, label='Users')
 
     for edge in mst.edges():
         line = LineString([gdf_final_poles.geometry.iloc[edge[0]], gdf_final_poles.geometry.iloc[edge[1]]])
@@ -228,7 +307,20 @@ if roads_file and users_file:
         )
 
         # Keep only poles with at least one building
-        gdf_associated_poles = gdf_associated_poles[gdf_associated_poles.index.isin(associations_df['pole_id'])]
+        gdf_associated_poles = gdf_associated_poles[gdf_associated_poles.index.isin(associations_df['pole_id'])].copy()
+
+        # IMPORTANT: after pruning, reset pole ids to 0..N-1 (stable) and remap associations accordingly
+        gdf_associated_poles["old_pole_id"] = gdf_associated_poles.index
+        gdf_associated_poles = gdf_associated_poles.reset_index(drop=True)
+        old_to_new = dict(zip(gdf_associated_poles["old_pole_id"].tolist(), gdf_associated_poles.index.tolist()))
+
+        associations_df = associations_df.copy()
+        associations_df["pole_id"] = associations_df["pole_id"].map(old_to_new)
+        if associations_df["pole_id"].isna().any():
+            n_bad = int(associations_df["pole_id"].isna().sum())
+            st.warning(f"{n_bad} association rows lost during pole-id remap after pruning and were dropped.")
+            associations_df = associations_df.dropna(subset=["pole_id"]).copy()
+        associations_df["pole_id"] = associations_df["pole_id"].astype(int)
 
         gdf_unassociated_buildings = gdf_buildings[~gdf_buildings.index.isin(associations_df['building_id'])]
 
@@ -237,17 +329,32 @@ if roads_file and users_file:
         )
 
         # Merge poles
-        gdf_final_poles = pd.concat([gdf_associated_poles, gdf_new_poles])
+        gdf_new_poles = gdf_new_poles.reset_index(drop=True)
+
+        # Drop helper column before merge
+        gdf_associated_poles_export = gdf_associated_poles.drop(columns=["old_pole_id"], errors="ignore")
+        gdf_final_poles = pd.concat([gdf_associated_poles_export, gdf_new_poles], ignore_index=True)
         gdf_final_poles = gpd.GeoDataFrame(gdf_final_poles, geometry="geometry", crs=gdf_buildings.crs)
 
         # Update associations with new poles
         # new_associations: (pole_geometry, building_id)
         new_associations_df = pd.DataFrame(new_associations, columns=['pole', 'building_id'])
 
-        # Find pole_id in gdf_final_poles by matching geometry
-        new_associations_df['pole_id'] = new_associations_df['pole'].apply(
-            lambda x: gdf_final_poles[gdf_final_poles.geometry == x].index[0]
-        )
+        # Map new pole geometries to their ids in the merged gdf_final_poles
+        offset_new = len(gdf_associated_poles_export)
+        geom_to_local = {geom.wkb: i for i, geom in enumerate(gdf_new_poles.geometry)}
+        def _map_new_pole_id(geom):
+            key = geom.wkb
+            if key not in geom_to_local:
+                return None
+            return int(offset_new + geom_to_local[key])
+
+        new_associations_df['pole_id'] = new_associations_df['pole'].apply(_map_new_pole_id)
+        if new_associations_df['pole_id'].isna().any():
+            n_bad = int(new_associations_df['pole_id'].isna().sum())
+            st.warning(f"{n_bad} new-association rows could not be mapped to new pole ids and were dropped.")
+            new_associations_df = new_associations_df.dropna(subset=['pole_id']).copy()
+        new_associations_df['pole_id'] = new_associations_df['pole_id'].astype(int)
 
         # Append new associations
         associations_df = pd.concat(
@@ -257,6 +364,14 @@ if roads_file and users_file:
 
         # Minimum Spanning Tree (MST)
         mst = create_graph_and_mst(gdf_final_poles)
+
+        # Post-process: insert intermediate poles on any long MST branch
+        if densify_long_edges:
+            gdf_final_poles, mst = densify_mst_edges(gdf_final_poles, mst, sampling_distance)
+
+        # Post-process: add intermediate poles along long branches so max edge <= sampling_distance
+        if densify_long_edges:
+            gdf_final_poles, mst = densify_mst_edges(gdf_final_poles, mst, sampling_distance)
 
         # Calculate project information
         number_of_buildings = len(gdf_buildings)
