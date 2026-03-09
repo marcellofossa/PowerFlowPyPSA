@@ -1,5 +1,5 @@
 """
-pftoolV8 - Power Flow tool (PyPSA + Streamlit)
+Power Flow tool (PyPSA + Streamlit)
 
 Inputs (uploads):
 - PF Excel workbook (.xlsx) with sheets:
@@ -9,6 +9,7 @@ Inputs (uploads):
 - Nodes GeoJSON/GPKG: poles (points). Must contain an id column (preferred: "id" or "pole_id").
 - Edges GeoJSON/GPKG: LV network segments (lines) with endpoints (preferred: "source"/"target").
 - Associations CSV: building-to-pole mapping (building_id, pole_id).
+- OnSSET friendly: distribution grid GPKG (assumptions reguarding the load distribution will be done)
 
 Outputs:
 - Nodal voltages table:
@@ -21,6 +22,7 @@ Notes:
 - Loads are allocated across poles proportionally to the number of buildings mapped to each pole_id (from associations.csv).
 - PV/Genset/Battery are aggregated at the slack bus (pole_id = slack_pole_id).
 """
+from __future__ import annotations
 
 import io
 import os
@@ -30,8 +32,9 @@ import re
 import numpy as np
 import pandas as pd
 import geopandas as gpd
+from shapely.geometry import Point
 import streamlit as st
-
+import pypsa
 # ======================================================================================
 # Helpers: robust bus sorting + snapshot resolution
 # ======================================================================================
@@ -39,20 +42,7 @@ import streamlit as st
 _bus_num_re = re.compile(r"(\d+)$")
 
 def _bus_sort_key(label) -> int:
-    """
-    Aim
-        Provide a stable *numeric* sorting key for bus labels such as 'bus_12'.
-
-    How it works
-        Extracts the trailing integer from the label using a regular expression.
-        If no trailing number exists, it returns a very large value so those labels
-        are pushed to the end of the sorted list.
-
-    Why it is useful
-        Streamlit tables (and pandas) default to lexicographic sorting for strings,
-        which produces the undesired order: bus_1, bus_10, bus_100, ...
-        Using this key yields the human-expected order: bus_1, bus_2, ... bus_10.
-    """
+    """Sort key for bus labels like 'bus_12' (numeric)."""
     s = str(label)
     m = _bus_num_re.search(s)
     return int(m.group(1)) if m else 10**18
@@ -61,21 +51,7 @@ def _sorted_bus_index(bus_index):
     return sorted(list(bus_index), key=_bus_sort_key)
 
 def _resolve_snapshot(net: pypsa.Network, snap):
-    """
-    Aim
-        Ensure the snapshot label requested by the user matches the type/labels
-        stored inside `net.snapshots`.
-
-    How it works
-        Tries:
-          1) direct membership (e.g., 19 in snapshots)
-          2) string cast (e.g., "19" in snapshots)
-          3) int(float(...)) for Excel-like values such as 19.0
-
-    Why it is useful
-        A very common source of 'all NaN' (main issue with a big net) results is indexing time-series tables with
-        a snapshot key of the wrong type. This helper prevents that class of errors.
-    """
+    """Return a snapshot label that exists in net.snapshots (handles int/str mismatch)."""
     if snap in net.snapshots:
         return snap
     s = str(snap)
@@ -95,7 +71,6 @@ def _resolve_snapshot(net: pypsa.Network, snap):
         f"Selected snapshot {snap!r} not found in net.snapshots. " 
         f"Example snapshots: {list(net.snapshots[:10])}"
     )
-import pypsa
 
 
 # ======================================================================================
@@ -110,19 +85,7 @@ def _is_nan(x) -> bool:
 
 
 def _to_float(x, *, name: str) -> float:
-    """
-    Aim
-        Parse a numeric value coming from Excel into a Python float.
-
-    How it works
-        - Rejects None/NaN with a clear error message naming the parameter.
-        - Accepts numeric types directly.
-        - Accepts strings and supports the European decimal comma (e.g., '0,415').
-
-    Why it is useful
-        Prevents silent coercions and makes configuration errors obvious early,
-        before building the network and running the power flow.
-    """
+    """Convert Excel values to float (supports decimal comma like '0,415')."""
     if x is None or _is_nan(x):
         raise ValueError(f"Network parameter '{name}' is missing.")
     if isinstance(x, (int, float, np.integer, np.floating)):
@@ -135,32 +98,12 @@ def _to_float(x, *, name: str) -> float:
 
 
 def _to_int(x, *, name: str) -> int:
-    """
-    Aim
-        Parse an Excel value into an integer.
-
-    How it works
-        Uses `_to_float` and rounds before casting to int (handles 0, 0.0, "0").
-
-    Why it is useful
-        Parameters such as `slack_pole_id` and `crs_epsg` are logically integers;
-        keeping them as int avoids mismatches and indexing bugs.
-    """
+    """Convert Excel values to int (accepts '0', 0.0, etc.)."""
     return int(round(_to_float(x, name=name)))
 
 
 def _to_bool(x, *, name: str, default: bool = False) -> bool:
-    """
-    Aim
-        Parse Excel-like boolean fields into a Python bool.
-
-    How it works
-        Supports TRUE/FALSE, 1/0, yes/no, and Italian VERO/FALSO.
-        Missing values default to the provided `default`.
-
-    Why it is useful
-        Makes optional toggles resilient to the different ways spreadsheets encode booleans.
-    """
+    """Convert Excel values to bool (supports TRUE/FALSE and VERO/FALSO)."""
     if x is None or _is_nan(x):
         return default
     if isinstance(x, bool):
@@ -174,19 +117,7 @@ def _to_bool(x, *, name: str, default: bool = False) -> bool:
 # ======================================================================================
 
 def read_geojson(uploaded_file) -> gpd.GeoDataFrame:
-    """
-    Aim
-        Read an uploaded geographic vector file into a GeoDataFrame.
-
-    How it works
-        - For .geojson/.json: reads directly from bytes. NB: should be .geojson
-        - For .gpkg: writes to a temporary file (GeoPackage drivers usually require a path)
-          and then reads it with GeoPandas.
-
-    Why it is useful
-        The tool supports both GeoJSON and GeoPackage exports from GIS tools,
-        reducing friction for different workflows.
-    """
+    """Read an uploaded vector file (.geojson/.json/.gpkg) into a GeoDataFrame."""
     suffix = os.path.splitext(uploaded_file.name)[1].lower()
     data = uploaded_file.getvalue()
     if suffix in [".geojson", ".json"]:
@@ -207,20 +138,7 @@ def read_geojson(uploaded_file) -> gpd.GeoDataFrame:
 
 
 def load_and_project_geodata(uploaded_file, target_epsg: int) -> gpd.GeoDataFrame:
-    """
-    Aim
-        Load a geodata file and ensure it is in a metric CRS suitable for distance/length.
-
-    How it works
-        - Loads the file with `read_geojson`.
-        - Verifies a CRS is present.
-        - Reprojects to `target_epsg` when needed.
-        - Drops invalid geometries.
-
-    Why it is useful
-        Line lengths are used to compute electrical impedances. If the CRS is not metric
-        (or is inconsistent), computed lengths become wrong and the PF can diverge.
-    """
+    """Load a GeoDataFrame and project it to a metric CRS for length calculations."""
     gdf = read_geojson(uploaded_file)
     if gdf.crs is None:
         raise ValueError("Geo file has no CRS. Re-export with a CRS (e.g., EPSG:32633).")
@@ -232,16 +150,8 @@ def load_and_project_geodata(uploaded_file, target_epsg: int) -> gpd.GeoDataFram
 
 def load_associations_csv(uploaded_file) -> pd.DataFrame:
     """
-    Aim
-        Load the building-to-pole mapping (associations.csv) and normalize its schema.
-
-    How it works
-        - Accepts common column variants (pole_id/pole, building_id/building).
-        - Coerces pole_id to integer and rejects missing/non-numeric rows with examples.
-
-    Why it is useful
-        The load allocation step relies on integer pole IDs. Early validation prevents
-        hidden NaNs that later cause IntCasting errors or misallocated loads.
+    Load associations.csv and normalize columns to: pole_id, building_id.
+    Accepted variants: pole_id/pole and building_id/building.
     """
     df = pd.read_csv(uploaded_file)
     cols_l = {c.lower(): c for c in df.columns}
@@ -265,19 +175,7 @@ def load_associations_csv(uploaded_file) -> pd.DataFrame:
 
 
 def ensure_pole_id_column(gdf_nodes: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame, str]:
-    """
-    Aim
-        Guarantee that the nodes layer contains a usable pole identifier column.
-
-    How it works
-        - Uses an existing 'pole_id' column when present.
-        - Otherwise falls back to an 'id' column (common in exports).
-        - Otherwise creates pole_id from the GeoDataFrame index.
-
-    Why it is useful
-        The entire network construction (buses, load mapping, slack selection) depends on
-        a consistent pole identifier. There were issues due to "bus_12" =! "12".
-    """
+    """Ensure nodes have a 'pole_id' column; fall back to 'id' or index."""
     cols_l = [c.lower() for c in gdf_nodes.columns]
     if "pole_id" in cols_l:
         pole_col = next(c for c in gdf_nodes.columns if c.lower() == "pole_id")
@@ -294,17 +192,7 @@ def ensure_pole_id_column(gdf_nodes: gpd.GeoDataFrame) -> tuple[gpd.GeoDataFrame
 
 
 def infer_edge_endpoints(gdf_edges: gpd.GeoDataFrame) -> tuple[str, str]:
-    """
-    Aim
-        Detect which columns identify the endpoints of each edge/line segment.
-
-    How it works
-        Searches for common endpoint column pairs:
-          (source,target), (bus0,bus1), (from,to), (u,v) N.B.: currently (source,target)
-
-    Why it is useful
-        Makes the tool robust to different naming conventions from GIS/export pipelines.
-    """
+    """Detect endpoint columns for edges (supports source/target and common variants)."""
     candidates = [("source", "target"), ("bus0", "bus1"), ("from", "to"), ("u", "v")] # source and target are currently used
     cols = set([c.lower() for c in gdf_edges.columns])
     for a, b in candidates:
@@ -320,20 +208,7 @@ def infer_edge_endpoints(gdf_edges: gpd.GeoDataFrame) -> tuple[str, str]:
 # ======================================================================================
 
 def read_pf_workbook(uploaded_xlsx) -> tuple[dict, pd.DataFrame]:
-    """
-    Aim
-        Parse the PF Excel workbook into:
-        - `cfg`: a dictionary of network parameters
-        - `disp_raw`: the raw Dispatch sheet as a DataFrame
-
-    How it works
-        - Validates the presence of 'Network' and 'Dispatch' sheets.
-        - Reads Network rows formatted as Parameter/Value.
-        - Validates required parameters and parses them with `_to_float/_to_int/_to_bool`.
-
-    Why it is useful
-        The possibulity to pass a dictionary instead of 8 parameters makes the code more compact and cleaner.
-    """
+    """Read Network parameters and Dispatch time series from the PF Excel workbook."""
     xls = pd.ExcelFile(uploaded_xlsx)
     if "Network" not in xls.sheet_names or "Dispatch" not in xls.sheet_names:
         raise ValueError("Excel workbook must contain sheets named 'Network' and 'Dispatch'.")
@@ -378,20 +253,21 @@ def read_pf_workbook(uploaded_xlsx) -> tuple[dict, pd.DataFrame]:
 
 def normalize_dispatch(disp_raw: pd.DataFrame, reduce_load_by_unmet: bool = True) -> pd.DataFrame:
     """
-    Aim
-        Convert the raw Dispatch sheet into a standardized time-series table
-        that the PF model consumes.
+    Produce a minimal dispatch dataframe with kW columns used by PF:
+      - Load_kW (served)
+      - PV_used_kW
+      - Genset_out_kW
+      - Battery_to_load_kW
+      - Battery_charge_kW
 
-    How it works
-        - Detects column names (case-insensitive) for the supported schema.
-        - Builds an index of snapshots (hours).
-        - Produces:
-            Load_kW (served load, optionally reduced by Unmet Demand),
-            PV_used_kW, Genset_out_kW, Battery_to_load_kW, Battery_charge_kW.
-
-    Why it is useful
-        Lets you reuse the same PF model across different simulation outputs
-        (MicroGridsPy-like tables, or simplified tables).
+    Supports MicroGridsPy-style columns (your case):
+      hour,
+      Load HHs + Buzs, Load PH,
+      PV Net Production or PV to Load (+ PV to Battery),
+      Genset to Load (+ Genset to Battery),
+      Battery to Load,
+      PV to Battery, Genset to Battery,
+      Unmet Demand (optional)
     """
     df = disp_raw.copy()
     # Normalize column lookup: lowercase trimmed -> real name
@@ -423,14 +299,14 @@ def normalize_dispatch(disp_raw: pd.DataFrame, reduce_load_by_unmet: bool = True
     out = pd.DataFrame(index=snapshots)
 
     # --- Load total (kW) ---
-    build_load = pick("load hhs + buzs")
-    ph_load = pick("load ph")
+    vill_col = pick("load hhs + buzs")
+    ph_col = pick("load ph")
     total_load = None
 
-    if build_load is not None and ph_load is not None:
-        total_load = df[build_load].astype(float).fillna(0.0)
-        if ph_load is not None:
-            total_load = total_load + df[ph_load].astype(float).fillna(0.0)
+    if vill_col is not None:
+        total_load = df[vill_col].astype(float).fillna(0.0)
+        if ph_col is not None:
+            total_load = total_load + df[ph_col].astype(float).fillna(0.0)
     else:
         # Fallback to a generic "Load" column if present
         load_col = pick("load")
@@ -444,9 +320,7 @@ def normalize_dispatch(disp_raw: pd.DataFrame, reduce_load_by_unmet: bool = True
         if unmet_col is not None:
             total_load = (total_load - df[unmet_col].astype(float).fillna(0.0)).clip(lower=0.0)
 
-    out["Load_build_kW"] = pd.Series(build_load, index=out.index)
-    out["Load_ph_kW"]   = pd.Series(ph_load,   index=out.index)
-    out["Load_total_kW"] = pd.Series(total_load.values, index=out.index)
+    out["Load_kW"] = pd.Series(total_load.values, index=out.index)
 
     # --- PV used (kW) ---
     pv_net = pick("pv net production")
@@ -499,32 +373,7 @@ def build_network(
     dispatch_kW: pd.DataFrame,
     cfg: dict,
 ) -> pypsa.Network:
-    """
-    Aim
-        Build a PyPSA AC network from:
-          nodes (poles), edges (LV segments), associations (load mapping),
-          dispatch (time series), and configuration parameters.
-
-    How it works
-        1) Sets snapshots from the dispatch index.
-        2) Standardizes IDs for nodes and edge endpoints.
-        3) Creates one Bus per pole (named 'bus_{pole_id}') and assigns v_nom.
-        4) Creates Lines from the edges geometry:
-           - computes length (m -> km),
-           - computes R and X from per-km values,
-           - adds one PyPSA Line per segment.
-        5) Allocates total served load to poles proportionally to the number of
-           buildings mapped to each pole_id.
-        6) Adds aggregated sources at the slack bus:
-           PV, genset, battery discharge (as PQ generators),
-           and battery charging as an additional Load.
-        7) Adds one Slack generator (control='Slack') to ensure the power balance
-           and provide a reference for the PF.
-
-    Why it is useful
-        This is the "model assembly" step: once the network is built correctly,
-        PF runs become repeatable and comparable across scenarios and snapshots.
-    """
+    """Build a PyPSA AC network for PF using node/edge geometry and dispatch time series."""
     net = pypsa.Network()
     snapshots = dispatch_kW.index.tolist()
     net.set_snapshots(snapshots)
@@ -544,12 +393,9 @@ def build_network(
     # Poles referenced by edges
     u_vals = pd.to_numeric(gdf_edges[u_col], errors="coerce")
     v_vals = pd.to_numeric(gdf_edges[v_col], errors="coerce")
-    # set deletes duplicates, dropna deletes NaN, astype(int) converts to int, tolist lists them.
     edge_poles = set(pd.concat([u_vals, v_vals], ignore_index=True).dropna().astype(int).tolist())
 
     # Poles referenced by loads (associations)
-    # some poles with an associated building may be disconnected from the grid, 
-    # including them allows the code to track this phenomena after.
     assoc_poles = set(pd.to_numeric(associations["pole_id"], errors="coerce").dropna().astype(int).unique().tolist())
 
     used_poles = edge_poles | assoc_poles | {slack_pole_id}
@@ -614,11 +460,20 @@ def build_network(
     orphan_load_poles = [pid for pid in load_poles if pole_to_bus.get(pid) not in connected_buses and pid != slack_pole_id]
     if orphan_load_poles:
         example = orphan_load_poles[:20]
-        raise ValueError(
-            "Some poles receive load (from associations.csv) but are not connected by any edge. "
-            "This creates electrical islands (size=1) and PF cannot run. "
-            f"Example pole_ids (up to 20): {example}"
-        )
+        if bool(cfg.get("drop_orphan_load_poles", False)):
+            # Drop associations for orphan poles (keeps network solvable). This is useful for OnSSET,
+            # where some exported poles may not be referenced by any line segment after snapping.
+            st.warning(
+                "Some poles receive load but are not connected by any edge (electrical islands). "
+                f"Dropping their loads to allow PF. Example pole_ids (up to 20): {example}"
+            )
+            associations = associations.loc[~associations["pole_id"].isin(orphan_load_poles)].copy()
+        else:
+            raise ValueError(
+                "Some poles receive load (from associations.csv) but are not connected by any edge. "
+                "This creates electrical islands (size=1) and PF cannot run. "
+                f"Example pole_ids (up to 20): {example}"
+            )
 
     # Allocate served load across poles proportionally to number of buildings per pole
     bcount = associations.groupby("pole_id").size()
@@ -633,7 +488,7 @@ def build_network(
     for pole_id, n_bld in bcount.items():
         pole_id = int(pole_id)
         share = float(n_bld) / total_buildings
-        p_MW = (dispatch_kW["Load_build_kW"] * share) / 1000.0
+        p_MW = (dispatch_kW["Load_kW"] * share) / 1000.0
         q_MVAr = p_MW * tanphi
 
         net.add(
@@ -669,22 +524,9 @@ def build_network(
     return net
 
 def _pre_pf_diagnostics(net, slack_pole_id, snap):
-    """
-    Aim
-        Run lightweight checks that catch the most common PF failure modes
-        *before* running `net.pf(...)`.
-
-    How it works
-        - Resolves the slack bus label (supports bus_{id} naming).
-        - Checks that v_nom exists and is non-missing for all buses.
-        - Verifies at least one Slack generator exists and is attached to the slack bus.
-        - Ensures the requested snapshot exists (via `_resolve_snapshot`).
-        - Runs PyPSA's topology detection and raises if multiple islands exist.
-
-    Why it is useful
-        Without these checks you often get opaque errors (or NaN results). This function
-        fails fast and points to the exact input inconsistency (IDs, missing v_nom, islands).
-    """
+    """Run sanity checks before calling net.pf(). Raises ValueError with actionable messages."""
+    import pandas as pd
+    import numpy as np
 
     if slack_pole_id is None:
         raise ValueError("Slack pole id is None. Set slack_pole_id in the workbook 'Network' sheet.")
@@ -742,37 +584,80 @@ def _pre_pf_diagnostics(net, slack_pole_id, snap):
     # --- Snapshot sanity (handle int/str mismatch) ---
     _ = _resolve_snapshot(net, snap)
 
-    # --- Topology / islands check (version-robust) ---
+    # --- Topology / islands handling (version-robust) ---
+    # PyPSA requires a slack generator in EACH island. For OnSSET (and often for real GIS-derived graphs),
+    # small islands/orphan buses can appear due to snapping / reduced export granularity.
+    # Policy: keep ONLY the connected component (sub_network) that contains the chosen slack bus,
+    # and drop all other islands before running PF. This is transparent and avoids silent wrong results.
     try:
         net.determine_network_topology()
         if "sub_network" in net.buses.columns:
             sn_sizes = net.buses["sub_network"].value_counts(dropna=False)
             if len(sn_sizes) > 1:
                 slack_sn = net.buses.at[slack_bus, "sub_network"]
-                raise ValueError(
-                    "Network has electrical islands (multiple sub_networks). PyPSA requires a slack generator in EACH island, "
-                    "or you must remove islands / orphan buses before PF. "
-                    f"Slack bus '{slack_bus}' is in sub_network: {slack_sn}. "
+                # Inform user
+                msg = (
+                    "Network has electrical islands (multiple sub_networks). "
+                    f"Keeping only the island containing slack bus '{slack_bus}' (sub_network={slack_sn}) "
+                    "and dropping the others. "
                     f"Sub-network sizes (top 10): {sn_sizes.head(10).to_dict()}"
                 )
+                try:
+                    import streamlit as st
+                    st.warning(msg)
+                except Exception:
+                    print("WARNING:", msg)
+
+                keep_buses = net.buses.index[net.buses["sub_network"].astype(str) == str(slack_sn)].tolist()
+                drop_buses = [b for b in net.buses.index.tolist() if b not in set(keep_buses)]
+
+                # Drop components attached to buses that will be removed
+                def _remove_many(component_name, names):
+                    names = list(names or [])
+                    if not names:
+                        return
+                    # Older PyPSA versions do not have mremove; fall back to remove in a loop.
+                    if hasattr(net, "mremove"):
+                        net.mremove(component_name, names)
+                    else:
+                        for name in names:
+                            net.remove(component_name, name)
+
+                def _drop_by_bus(component_name, df, bus_cols=("bus", "bus0", "bus1")):
+                    if df is None or df.empty:
+                        return
+                    cols = [c for c in bus_cols if c in df.columns]
+                    if not cols:
+                        return
+                    keep_bus_set = set(map(str, keep_buses))
+                    mask = pd.Series(False, index=df.index)
+                    for c in cols:
+                        mask = mask | (~df[c].astype(str).isin(keep_bus_set))
+                    to_drop = df.index[mask].tolist()
+                    if to_drop:
+                        _remove_many(component_name, to_drop)
+
+                _drop_by_bus("Load", net.loads, ("bus",))
+                _drop_by_bus("Generator", net.generators, ("bus",))
+                _drop_by_bus("Line", net.lines, ("bus0", "bus1"))
+                _drop_by_bus("Transformer", getattr(net, "transformers", None), ("bus0", "bus1"))
+                _drop_by_bus("ShuntImpedance", getattr(net, "shunt_impedances", None), ("bus",))
+                _drop_by_bus("Store", getattr(net, "stores", None), ("bus",))
+                _drop_by_bus("StorageUnit", getattr(net, "storage_units", None), ("bus",))
+
+                # Finally drop buses
+                if drop_buses:
+                    _remove_many("Bus", drop_buses)
+
+                # Recompute topology after pruning
+                net.determine_network_topology()
+
     except Exception as topo_e:
-        raise ValueError(f"Topology check failed: {repr(topo_e)}")
+        raise ValueError(f"Topology handling failed: {repr(topo_e)}")
 
     return slack_bus
 def nodal_voltage_table(net: pypsa.Network, snapshot) -> pd.DataFrame:
-    """
-    Aim
-        Produce a tidy table of nodal voltage results for a given snapshot.
-
-    How it works
-        - Reads per-unit magnitudes `net.buses_t.v_mag_pu` for the snapshot.
-        - Converts to absolute voltage in Volts using v_nom (kV -> V).
-        - Computes deviation from nominal (ΔV) and percentage deviation.
-
-    Why it is useful
-        It turns PyPSA internal result tables into a report-ready format that can be
-        exported and compared across scenarios.
-    """
+    """Return nodal voltage results (absolute and deviations from nominal)."""
     buses = net.buses.index
     v_nom_V = net.buses.v_nom.reindex(buses).astype(float) * 1000.0  # kV -> V (line-to-line)
     v_pu = net.buses_t.v_mag_pu.loc[snapshot].reindex(buses).astype(float)
@@ -783,34 +668,30 @@ def nodal_voltage_table(net: pypsa.Network, snapshot) -> pd.DataFrame:
 
     df = pd.DataFrame({
         "Bus": buses,
-        "V_abs_V": v_abs_V.values,
-        "DeltaV_V": delta_V.values,
-        "DeltaV_pct": delta_pct.values,
+        "V bus [V]": v_abs_V.values,
+        "deltaV bus [V]": delta_V.values,
+        "deltaV% bus [%]": delta_pct.values,
     })
-    df = df.sort_values('Bus', key=lambda s: s.map(_bus_sort_key)).reset_index(drop=True)
-    return df.sort_values("Bus").reset_index(drop=True)
+
+    # Natural sort by bus number: bus_1, bus_2, ..., bus_10
+    df["_busn"] = df["Bus"].map(_bus_sort_key)
+    df = df.sort_values(["_busn", "Bus"]).drop(columns=["_busn"]).reset_index(drop=True)
+    return df
 
 
 def branch_current_table(net: pypsa.Network, snapshot) -> pd.DataFrame:
     """
-    Aim
-        Estimate branch currents for each line at a given snapshot.
-
-    How it works
-        - Uses line-end active/reactive power (p0,q0,p1,q1) from PyPSA.
-        - Computes apparent power |S| at each end.
-        - Estimates current via I = |S| / (sqrt(3) * V_LL) using the end-bus voltage.
-
-    Why it is useful
-        Distribution planning often needs currents for thermal limits and sizing;
-        this provides a consistent approximation even when direct current results
-        are not available in the installed PyPSA version.
+    Compute branch currents from line-end apparent power and bus voltage:
+      I = |S| / (sqrt(3) * V_LL)
+    (assumes 3-phase line-to-line voltage in net.buses.v_nom)
     """
     rows = []
     sqrt3 = math.sqrt(3.0)
 
     v_pu = net.buses_t.v_mag_pu.loc[snapshot]
     v_LL = (net.buses.v_nom * 1000.0) * v_pu  # V
+
+    lengths_m = net.lines.length.astype(float) * 1000.0  # km -> m
 
     for ln in net.lines.index:
         b0 = net.lines.at[ln, "bus0"]
@@ -834,63 +715,372 @@ def branch_current_table(net: pypsa.Network, snapshot) -> pd.DataFrame:
             "Line": ln,
             "Bus0": b0,
             "Bus1": b1,
-            "I0_A": i0,
-            "I1_A": i1,
-            "Imax_A": np.nanmax([i0, i1]),
+            "Branch length [m]": float(lengths_m.loc[ln]),
+            "I [A]": np.nanmax([i0, i1]),
+            "S [kVA]": 1000.0 * np.nanmax([s0_MVA, s1_MVA]),
         })
 
     df = pd.DataFrame(rows)
-    df = df.sort_values(['Bus0','Bus1'], key=lambda s: s.map(_bus_sort_key)).reset_index(drop=True)
-    return df.sort_values("Line").reset_index(drop=True)
+
+    # Natural sort: first by Bus0 number, then Bus1 number, then line endpoints (e.g. line_0_17, line_0_18, ...)
+    df["_bus0n"] = df["Bus0"].map(_bus_sort_key)
+    df["_bus1n"] = df["Bus1"].map(_bus_sort_key)
+
+    def _line_u_v_nums(name: str):
+        nums = re.findall(r"\d+", str(name))
+        if len(nums) >= 2:
+            return int(nums[0]), int(nums[1])
+        if len(nums) == 1:
+            return int(nums[0]), 10**18
+        return 10**18, 10**18
+
+    uv = df["Line"].map(_line_u_v_nums)
+    df["_lu"] = uv.map(lambda t: t[0])
+    df["_lv"] = uv.map(lambda t: t[1])
+
+    df = (
+        df.sort_values(["_bus0n", "_bus1n", "_lu", "_lv", "Line"])
+          .drop(columns=["_bus0n", "_bus1n", "_lu", "_lv"])
+          .reset_index(drop=True)
+    )
+    return df
+
+
+
+
+# ======================================================================================
+# OnSSET GPKG adapter (Trunk/Laterals/Service_lines/Poles -> nodes/edges/associations)
+# ======================================================================================
+
+def _write_tmp_uploaded(uploaded_file, suffix: str) -> str:
+    """Write Streamlit uploaded file bytes to a temp path and return it."""
+    data = uploaded_file.getvalue()
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(data)
+        return tmp.name
+
+
+def read_gpkg_layer(uploaded_file, layer: str) -> gpd.GeoDataFrame:
+    """Read a specific layer from an uploaded GeoPackage."""
+    tmp_path = _write_tmp_uploaded(uploaded_file, suffix=".gpkg")
+    try:
+        return gpd.read_file(tmp_path, layer=layer)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _explode_to_primitives(gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Explode multi-geometries and keep only Points/LineStrings."""
+    gdf = gdf.copy()
+    gdf = gdf[gdf.geometry.notna()].copy()
+    gdf = gdf[gdf.is_valid].copy()
+    # explode multiparts
+    try:
+        gdf = gdf.explode(index_parts=False, ignore_index=True)
+    except TypeError:
+        gdf = gdf.explode(index_parts=False)
+        gdf = gdf.reset_index(drop=True)
+    # keep supported
+    gdf = gdf[gdf.geometry.type.isin(["Point", "LineString"])].copy()
+    return gdf
+
+
+def onsett_gpkg_to_graph(
+    uploaded_gpkg,
+    *,
+    target_epsg: int,
+    snap_tolerance_m: float = 50.0,
+    drop_duplicate_edges: bool = True,
+) -> tuple[gpd.GeoDataFrame, gpd.GeoDataFrame]:
+    """
+    Convert OnSSET mini-grid gpkg to:
+      - nodes GeoDataFrame with 'pole_id' (0..N-1)
+      - edges GeoDataFrame with 'source','target','length_m','net_type'
+
+    Approximations (explicit, as per your methodology):
+      - No explicit service poles beyond those in gpkg Poles layer.
+      - Edge endpoints are inferred by snapping each segment endpoint to the nearest pole.
+    """
+    # --- Read layers ---
+    poles = read_gpkg_layer(uploaded_gpkg, "Poles")
+    trunk = read_gpkg_layer(uploaded_gpkg, "Trunk_line")
+    lat = read_gpkg_layer(uploaded_gpkg, "Laterals")
+    srv = read_gpkg_layer(uploaded_gpkg, "Service_lines")
+
+    # --- Project to metric CRS ---
+    for g in (poles, trunk, lat, srv):
+        if g.crs is None:
+            raise ValueError("OnSSET gpkg layer has no CRS. Re-export it with a CRS.")
+    if poles.crs.to_epsg() != int(target_epsg):
+        poles = poles.to_crs(epsg=int(target_epsg))
+    if trunk.crs.to_epsg() != int(target_epsg):
+        trunk = trunk.to_crs(epsg=int(target_epsg))
+    if lat.crs.to_epsg() != int(target_epsg):
+        lat = lat.to_crs(epsg=int(target_epsg))
+    if srv.crs.to_epsg() != int(target_epsg):
+        srv = srv.to_crs(epsg=int(target_epsg))
+
+    # --- Explode to primitives ---
+    poles = _explode_to_primitives(poles)
+    trunk = _explode_to_primitives(trunk)
+    lat = _explode_to_primitives(lat)
+    srv = _explode_to_primitives(srv)
+
+    # --- Nodes ---
+    nodes = poles.copy()
+    nodes = nodes.reset_index(drop=True)
+    if len(nodes) == 0:
+        raise ValueError("OnSSET gpkg: Poles layer has 0 points after explode.")
+    nodes["pole_id"] = np.arange(len(nodes), dtype=int)
+
+    # --- Edges: concat all types ---
+    edges = pd.concat(
+        [
+            trunk.assign(net_type="trunk"),
+            lat.assign(net_type="lateral"),
+            srv.assign(net_type="service"),
+        ],
+        ignore_index=True,
+    )
+    edges = edges[edges.geometry.type.eq("LineString")].copy()
+    if len(edges) == 0:
+        raise ValueError("OnSSET gpkg: no LineString segments found in Trunk/Laterals/Service_lines.")
+
+    # --- Build endpoints GeoDataFrame (two points per segment) ---
+    starts = []
+    ends = []
+    for i, geom in enumerate(edges.geometry.tolist()):
+        coords = list(geom.coords)
+        starts.append(Point(coords[0]))
+        ends.append(Point(coords[-1]))
+
+    endpts = gpd.GeoDataFrame(
+        {
+            "seg_i": np.repeat(np.arange(len(edges), dtype=int), 2),
+            "side": ["start", "end"] * len(edges),
+        },
+        geometry=starts + ends,
+        crs=edges.crs,
+    )
+
+    # --- Snap endpoints to nearest pole ---
+    # Use spatial join nearest; fallback to brute force if unavailable
+    try:
+        joined = gpd.sjoin_nearest(
+            endpts,
+            nodes[["pole_id", "geometry"]],
+            how="left",
+            distance_col="snap_dist_m",
+            max_distance=float(snap_tolerance_m),
+        )
+    except Exception:
+        # brute force (slower, but robust)
+        node_xy = np.vstack([nodes.geometry.x.values, nodes.geometry.y.values]).T
+        out_pole = []
+        out_dist = []
+        for pt in endpts.geometry:
+            dx = node_xy[:, 0] - pt.x
+            dy = node_xy[:, 1] - pt.y
+            d = np.hypot(dx, dy)
+            j = int(np.argmin(d))
+            out_pole.append(int(nodes.iloc[j]["pole_id"]))
+            out_dist.append(float(d[j]))
+        joined = endpts.copy()
+        joined["pole_id"] = out_pole
+        joined["snap_dist_m"] = out_dist
+        joined.loc[joined["snap_dist_m"] > float(snap_tolerance_m), "pole_id"] = np.nan
+
+    n_missing = int(joined["pole_id"].isna().sum())
+    if n_missing > 0:
+        # Robust fallback for OnSSET exports:
+        # if some segment endpoints cannot be snapped within the tolerance, we create
+        # *virtual poles* exactly at those endpoints, so the reconstructed graph is
+        # still electrically consistent for PF comparisons.
+        missing = joined.loc[joined["pole_id"].isna()].copy()
+
+        # Identify truly invalid endpoint geometries (empty or NaN coords). These indicate
+        # corrupted geometries/CRS and should be fixed at source.
+        invalid = missing.geometry.isna() | missing.geometry.is_empty
+        invalid = invalid | (~np.isfinite(missing.geometry.x.values)) | (~np.isfinite(missing.geometry.y.values))
+        if invalid.any():
+            ex = missing.loc[invalid, ["seg_i", "side"]].head(10).to_dict(orient="records")
+            raise ValueError(
+                f"OnSSET gpkg: {int(invalid.sum())} endpoint geometries are invalid (empty/NaN). "
+                f"Examples (up to 10): {ex}. Fix: re-export gpkg with valid geometries/CRS."
+            )
+
+        next_id = int(nodes["pole_id"].max()) + 1
+        created = 0
+        # Create one virtual pole per missing endpoint (simple + deterministic)
+        for ridx, row in missing.iterrows():
+            pt = row.geometry
+            nodes = pd.concat(
+                [
+                    nodes,
+                    gpd.GeoDataFrame(
+                        [{"pole_id": next_id, "geometry": pt, "pole_origin": "onsett_virtual"}],
+                        crs=nodes.crs,
+                    ),
+                ],
+                ignore_index=True,
+            )
+            joined.loc[ridx, "pole_id"] = next_id
+            joined.loc[ridx, "snap_dist_m"] = 0.0
+            next_id += 1
+            created += 1
+
+        if "st" in globals():
+            st.warning(
+                f"OnSSET: {n_missing} segment endpoints could not be snapped within {snap_tolerance_m} m. "
+                f"Created {created} virtual poles at those endpoints (assumption for methodology)."
+            )
+
+    # --- Assemble source/target ---
+    joined["pole_id"] = joined["pole_id"].astype(int)
+    piv = joined.pivot_table(index="seg_i", columns="side", values="pole_id", aggfunc="first")
+    edges = edges.reset_index(drop=True)
+    edges["source"] = piv["start"].reindex(range(len(edges))).astype(int).values
+    edges["target"] = piv["end"].reindex(range(len(edges))).astype(int).values
+
+    edges["length_m"] = edges.geometry.length.astype(float)
+    edges = edges[edges["length_m"] > 1e-6].copy()
+
+    # Optionally drop duplicate undirected edges (common when snapping)
+    if drop_duplicate_edges:
+        a = np.minimum(edges["source"].values, edges["target"].values)
+        b = np.maximum(edges["source"].values, edges["target"].values)
+        edges["_ab"] = list(zip(a.tolist(), b.tolist(), edges["net_type"].astype(str).tolist()))
+        edges = edges.drop_duplicates(subset=["_ab"]).drop(columns=["_ab"]).reset_index(drop=True)
+
+    # Keep only columns expected downstream
+    edges_out = edges[["source", "target", "net_type", "length_m", "geometry"]].copy()
+    nodes_out = nodes[["pole_id", "geometry"]].copy()
+    return nodes_out, edges_out
+
+
+def make_uniform_associations(pole_ids: list[int]) -> pd.DataFrame:
+    """
+    Create a synthetic associations table with the SAME number of buildings per pole (1 each).
+    This implements your stated approximation when building-to-pole mapping is unavailable.
+    """
+    pole_ids = [int(p) for p in pole_ids]
+    return pd.DataFrame({"building_id": np.arange(len(pole_ids), dtype=int), "pole_id": pole_ids})
+
+
+def connected_poles_from_edges(gdf_edges: gpd.GeoDataFrame) -> list[int]:
+    """Return sorted unique pole_ids that appear in edges endpoints (source/target)."""
+    if gdf_edges is None or len(gdf_edges) == 0:
+        return []
+    pole_ids = pd.concat(
+        [
+            pd.to_numeric(gdf_edges.get("source"), errors="coerce"),
+            pd.to_numeric(gdf_edges.get("target"), errors="coerce"),
+        ],
+        ignore_index=True,
+    ).dropna()
+    try:
+        pole_ids = pole_ids.astype(int)
+    except Exception:
+        pole_ids = pole_ids.astype(float).astype(int)
+    return sorted(pole_ids.unique().tolist())
+
+
 
 
 # ======================================================================================
 # Streamlit App
 # ======================================================================================
 
-# --------------------------------------------------------------------------------------
-# STREAMLIT UI / MAIN RUN FLOW
-#
-# The app is organized in three phases:
-#   (1) Upload inputs (Excel + geodata + associations)
-#   (2) Parse/validate inputs and build the PF-ready data structures
-#   (3) Build the PyPSA network and run an AC power flow for ONE selected snapshot
-#
-# Why a single snapshot?
-#   Running an AC PF for all hours can be slow in a Streamlit app. Most debugging and
-#   engineering checks (voltage drops, current peaks, bottlenecks) can be performed on
-#   representative hours selected from the dispatch (peak load, peak PV, worst-case).
-#
-# What happens when the user clicks "Run Power Flow"?
-#   - We call build_network(...) to assemble buses, lines, loads, and generators.
-#   - We call _pre_pf_diagnostics(...) to catch typical input issues early.
-#   - We call net.pf(snapshots=[snap]) to solve the AC PF for that hour.
-#   - We post-process results into human-friendly tables:
-#         nodal_voltage_table(...) and branch_current_table(...)
-# --------------------------------------------------------------------------------------
-
-st.set_page_config(page_title="pftoolV7", layout="wide")
-st.title("pftoolV7 - Slim Power Flow (Excel + GeoJSON + Associations)")
+st.set_page_config(page_title="pftoolV8", layout="wide")
+st.title("pftoolV8 - Slim Power Flow (Excel + GeoJSON + Associations)")
 
 st.subheader("1) Upload inputs")
+
+input_mode = st.radio(
+    "Input mode",
+    ["Custom tool (nodes+edges+associations)", "OnSSET mini-grid (single .gpkg)"],
+    index=0,
+    help=(
+        "Use 'OnSSET' if you have a GeoPackage with layers: Poles, Trunk_line, Laterals, Service_lines. "
+        "Endpoints are inferred by snapping segment endpoints to nearest poles."
+    ),
+)
+
 pf_excel = st.file_uploader("PF Excel workbook (.xlsx) with sheets: Network, Dispatch", type=["xlsx", "xls"])
-nodes_file = st.file_uploader("Nodes (mst_nodes.geojson / .gpkg)", type=["geojson", "json", "gpkg"])
-edges_file = st.file_uploader("Edges (mst_edges.geojson / .gpkg)", type=["geojson", "json", "gpkg"])
-assoc_file = st.file_uploader("Associations (associations.csv)", type=["csv"])
 
 reduce_load_by_unmet = st.checkbox("Use served load = Load - Unmet Demand (if present)", value=True)
 
-if pf_excel and nodes_file and edges_file and assoc_file:
+if input_mode.startswith("Custom"):
+    nodes_file = st.file_uploader("Nodes (mst_nodes.geojson / .gpkg)", type=["geojson", "json", "gpkg"])
+    edges_file = st.file_uploader("Edges (mst_edges.geojson / .gpkg)", type=["geojson", "json", "gpkg"])
+    assoc_file = st.file_uploader("Associations (associations.csv)", type=["csv"])
+    onsett_gpkg = None
+else:
+    onsett_gpkg = st.file_uploader("OnSSET distribution_grid.gpkg", type=["gpkg"])
+    snap_tol = st.number_input("OnSSET snapping tolerance [m]", min_value=1.0, max_value=500.0, value=50.0, step=1.0)
+    assoc_file = st.file_uploader(
+        "Optional associations.csv (if you DO have building-to-pole mapping). If omitted, load is spread uniformly across poles.",
+        type=["csv"],
+    )
+    nodes_file = None
+    edges_file = None
+
+def _inputs_ready():
+    if pf_excel is None:
+        return False
+    if input_mode.startswith("Custom"):
+        return nodes_file is not None and edges_file is not None and assoc_file is not None
+    return onsett_gpkg is not None
+
+if _inputs_ready():
     try:
         cfg, disp_raw = read_pf_workbook(pf_excel)
         dispatch_kW = normalize_dispatch(disp_raw, reduce_load_by_unmet=reduce_load_by_unmet)
 
-        gdf_nodes = load_and_project_geodata(nodes_file, cfg["crs_epsg"])
-        gdf_edges = load_and_project_geodata(edges_file, cfg["crs_epsg"])
-        associations = load_associations_csv(assoc_file)
+        if input_mode.startswith("Custom"):
+            gdf_nodes = load_and_project_geodata(nodes_file, cfg["crs_epsg"])
+            gdf_edges = load_and_project_geodata(edges_file, cfg["crs_epsg"])
+            associations = load_associations_csv(assoc_file)
+        else:
+            gdf_nodes, gdf_edges = onsett_gpkg_to_graph(
+                onsett_gpkg,
+                target_epsg=int(cfg["crs_epsg"]),
+                snap_tolerance_m=float(snap_tol),
+            )
+            if assoc_file is not None:
+                associations = load_associations_csv(assoc_file)
+            else:
+                # Uniform allocation across ALL poles present in OnSSET file
+                # Uniform allocation across CONNECTED poles only (avoid 1-node electrical islands)
+                connected = connected_poles_from_edges(gdf_edges)
+                slack_pid = int(cfg.get("slack_pole_id", 0))
+                if slack_pid not in connected:
+                    connected = [slack_pid] + connected
+                n_iso = int(len(gdf_nodes) - len(set(connected)))
+                if n_iso > 0:
+                    st.warning(
+                        f"OnSSET: {n_iso} pole(s) are not referenced by any edge (isolated). "
+                        "They will be excluded from load allocation to avoid 1-node islands."
+                    )
+                associations = make_uniform_associations(connected)
+
+            cfg["drop_orphan_load_poles"] = True
+            st.info(
+                "OnSSET mode assumptions applied: "
+                "segment endpoints snapped to nearest poles; if no associations.csv provided, "
+                "loads are distributed uniformly across poles."
+            )
+            st.info(
+                "Important: since OnSSET poles have no original IDs, pole_id are assigned as 0..N-1. "
+                "Set slack_pole_id in the Excel 'Network' sheet accordingly (commonly 0)."
+            )
 
         st.success(f"Inputs loaded. Snapshots: {len(dispatch_kW)}. slack_pole_id={cfg['slack_pole_id']}")
         st.write("Network config (from Excel):", cfg)
+        st.write(f"Nodes: {len(gdf_nodes)} | Edges: {len(gdf_edges)} | Assoc rows: {len(associations)}")
     except Exception as e:
         st.error(f"Input error: {repr(e)}")
         st.exception(e)
@@ -901,15 +1091,8 @@ if pf_excel and nodes_file and edges_file and assoc_file:
 
     if st.button("Run Power Flow", type="primary"):
         try:
-            # Build network for ALL snapshots (required by PyPSA), but solve PF only for the selected one.
             net = build_network(gdf_nodes, gdf_edges, associations, dispatch_kW, cfg)
-            # Debug: snapshot typing + v_nom completeness
-            st.write('Selected snap:', snap, type(snap))
-            st.write('Snapshots dtype:', net.snapshots.dtype)
-            st.write('snap in net.snapshots?', snap in net.snapshots)
-            st.write('str(snap) in net.snapshots?', str(snap) in net.snapshots)
-            st.write('v_nom NaN buses:', int(net.buses.v_nom.isna().sum()))
-            slack_bus = _pre_pf_diagnostics(net, cfg.get('slack_pole_id'), snap)
+            slack_bus = _pre_pf_diagnostics(net, cfg.get("slack_pole_id"), snap)
             snap_key = _resolve_snapshot(net, snap)
             net.pf(snapshots=[snap_key])
         except Exception as e:
@@ -931,4 +1114,5 @@ if pf_excel and nodes_file and edges_file and assoc_file:
         st.download_button("Download nodal voltages CSV", vtab.to_csv(index=False).encode("utf-8"), "nodal_voltages.csv")
         st.download_button("Download branch currents CSV", itab.to_csv(index=False).encode("utf-8"), "branch_currents.csv")
 else:
-    st.info("Upload the PF Excel workbook, nodes, edges, and associations to enable the PF run.")
+    st.info("Upload the PF Excel workbook and the required network files to enable the PF run.")
+
