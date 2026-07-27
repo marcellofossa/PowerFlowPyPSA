@@ -1,0 +1,9 @@
+1. buildings.gpkg and roads.gpkg are geopackage(.gpkg) that contain the spatial coordinates of builldings and roads in the site.
+
+2. category_profiles.xlsx is an Excel file reporting the daily electricity demand for one building o each building types.
+
+3. building_metadata.xlsx is an Excel file containing the type of building associated with each building through the building ID.
+
+4. offgridplanner_data.xlsx is the Excel file downloaded from the OffGridPlanner website(link below) simulating a specific site.    https://nigeria.offgridplanner.org/en/accounts/login/?next=/en/ 
+
+5. Preliminary Sizing Tool is the Excel file created by Edoardo Silvestri. Use the first page to have an estimation of the buildings     specific consume. Pay attention: the daily load in this file represent the total village load!
