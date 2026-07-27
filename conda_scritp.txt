@@ -1,0 +1,7 @@
+conda env create -f environment.yml
+conda activate mgpy_distribution
+
+### **Running**
+
+```bash
+streamlit run app.py
